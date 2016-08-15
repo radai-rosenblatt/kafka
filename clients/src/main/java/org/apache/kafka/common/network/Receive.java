@@ -18,6 +18,8 @@ package org.apache.kafka.common.network;
 
 import java.io.IOException;
 import java.nio.channels.ScatteringByteChannel;
+import org.apache.kafka.common.memory.BufferPool;
+
 
 /**
  * This interface models the in-progress reading of data from a channel to a source identified by an integer id
@@ -40,6 +42,6 @@ public interface Receive {
      * @return The number of bytes read
      * @throws IOException If the reading fails
      */
-    public long readFrom(ScatteringByteChannel channel) throws IOException;
+    public long readFrom(ScatteringByteChannel channel, BufferPool memoryPool) throws IOException;
 
 }

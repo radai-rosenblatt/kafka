@@ -17,6 +17,8 @@ import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.channels.ReadableByteChannel;
 import java.nio.channels.ScatteringByteChannel;
+import org.apache.kafka.common.memory.BufferPool;
+
 
 /**
  * A size delimited Receive that consists of a 4 byte network-ordered size N followed by N bytes of content
@@ -29,6 +31,7 @@ public class NetworkReceive implements Receive {
     private final String source;
     private final ByteBuffer size;
     private final int maxSize;
+    private int requiredBufferSize;
     private ByteBuffer buffer;
 
 
@@ -67,15 +70,16 @@ public class NetworkReceive implements Receive {
         return !size.hasRemaining() && !buffer.hasRemaining();
     }
 
-    public long readFrom(ScatteringByteChannel channel) throws IOException {
-        return readFromReadableChannel(channel);
+    @Override
+    public long readFrom(ScatteringByteChannel channel, BufferPool memoryPool) throws IOException {
+        return readFromReadableChannel(channel, memoryPool);
     }
 
     // Need a method to read from ReadableByteChannel because BlockingChannel requires read with timeout
     // See: http://stackoverflow.com/questions/2866557/timeout-for-socketchannel-doesnt-work
     // This can go away after we get rid of BlockingChannel
     @Deprecated
-    public long readFromReadableChannel(ReadableByteChannel channel) throws IOException {
+    public long readFromReadableChannel(ReadableByteChannel channel, BufferPool memoryPool) throws IOException {
         int read = 0;
         if (size.hasRemaining()) {
             int bytesRead = channel.read(size);
@@ -89,9 +93,11 @@ public class NetworkReceive implements Receive {
                     throw new InvalidReceiveException("Invalid receive (size = " + receiveSize + ")");
                 if (maxSize != UNLIMITED && receiveSize > maxSize)
                     throw new InvalidReceiveException("Invalid receive (size = " + receiveSize + " larger than " + maxSize + ")");
-
-                this.buffer = ByteBuffer.allocate(receiveSize);
+                requiredBufferSize = receiveSize;
+                buffer = memoryPool.tryAllocate(receiveSize);
             }
+        } else if (buffer == null) { //means we failed to acquire memory previously
+            buffer = memoryPool.tryAllocate(requiredBufferSize);
         }
         if (buffer != null) {
             int bytesRead = channel.read(buffer);
