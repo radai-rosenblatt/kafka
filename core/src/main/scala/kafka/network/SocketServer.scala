@@ -32,6 +32,7 @@ import kafka.metrics.KafkaMetricsGroup
 import kafka.server.KafkaConfig
 import kafka.utils._
 import org.apache.kafka.common.errors.InvalidRequestException
+import org.apache.kafka.common.memory.{GarbageCollectedMemoryPool, MemoryPool}
 import org.apache.kafka.common.metrics._
 import org.apache.kafka.common.network.{ChannelBuilders, KafkaChannel, LoginType, Mode, Selectable, Selector => KSelector}
 import org.apache.kafka.common.security.auth.KafkaPrincipal
@@ -54,6 +55,7 @@ class SocketServer(val config: KafkaConfig, val metrics: Metrics, val time: Time
   private val endpoints = config.listeners
   private val numProcessorThreads = config.numNetworkThreads
   private val maxQueuedRequests = config.queuedMaxRequests
+  private val maxQueuedBytes = config.queuedMaxBytes
   private val totalProcessorThreads = numProcessorThreads * endpoints.size
 
   private val maxConnectionsPerIp = config.maxConnectionsPerIp
@@ -61,6 +63,7 @@ class SocketServer(val config: KafkaConfig, val metrics: Metrics, val time: Time
 
   this.logIdent = "[Socket Server on Broker " + config.brokerId + "], "
 
+  private val memoryPool = if (maxQueuedBytes > 0) new GarbageCollectedMemoryPool(maxQueuedBytes, config.socketRequestMaxBytes, false) else MemoryPool.NONE
   val requestChannel = new RequestChannel(totalProcessorThreads, maxQueuedRequests)
   private val processors = new Array[Processor](totalProcessorThreads)
 
@@ -91,7 +94,7 @@ class SocketServer(val config: KafkaConfig, val metrics: Metrics, val time: Time
         val processorEndIndex = processorBeginIndex + numProcessorThreads
 
         for (i <- processorBeginIndex until processorEndIndex)
-          processors(i) = newProcessor(i, connectionQuotas, protocol)
+          processors(i) = newProcessor(i, connectionQuotas, protocol, memoryPool)
 
         val acceptor = new Acceptor(endpoint, sendBufferSize, recvBufferSize, brokerId,
           processors.slice(processorBeginIndex, processorEndIndex), connectionQuotas)
@@ -137,7 +140,7 @@ class SocketServer(val config: KafkaConfig, val metrics: Metrics, val time: Time
   }
 
   /* `protected` for test usage */
-  protected[network] def newProcessor(id: Int, connectionQuotas: ConnectionQuotas, protocol: SecurityProtocol): Processor = {
+  protected[network] def newProcessor(id: Int, connectionQuotas: ConnectionQuotas, protocol: SecurityProtocol, memoryPool: MemoryPool): Processor = {
     new Processor(id,
       time,
       config.socketRequestMaxBytes,
@@ -146,7 +149,8 @@ class SocketServer(val config: KafkaConfig, val metrics: Metrics, val time: Time
       config.connectionsMaxIdleMs,
       protocol,
       config.values,
-      metrics
+      metrics,
+      memoryPool
     )
   }
 
@@ -365,7 +369,8 @@ private[kafka] class Processor(val id: Int,
                                connectionsMaxIdleMs: Long,
                                protocol: SecurityProtocol,
                                channelConfigs: java.util.Map[String, _],
-                               metrics: Metrics) extends AbstractServerThread(connectionQuotas) with KafkaMetricsGroup {
+                               metrics: Metrics,
+                               memoryPool: MemoryPool) extends AbstractServerThread(connectionQuotas) with KafkaMetricsGroup {
 
   private object ConnectionId {
     def fromString(s: String): Option[ConnectionId] = s.split("-") match {
@@ -403,7 +408,8 @@ private[kafka] class Processor(val id: Int,
     "socket-server",
     metricTags,
     false,
-    ChannelBuilders.create(protocol, Mode.SERVER, LoginType.SERVER, channelConfigs, null, true))
+    ChannelBuilders.create(protocol, Mode.SERVER, LoginType.SERVER, channelConfigs, null, true),
+    memoryPool)
 
   override def run() {
     startupComplete()
@@ -489,7 +495,7 @@ private[kafka] class Processor(val id: Int,
         val channel = selector.channel(receive.source)
         val session = RequestChannel.Session(new KafkaPrincipal(KafkaPrincipal.USER_TYPE, channel.principal.getName),
           channel.socketAddress)
-        val req = RequestChannel.Request(processor = id, connectionId = receive.source, session = session, buffer = receive.payload, startTimeMs = time.milliseconds, securityProtocol = protocol)
+        val req = RequestChannel.Request(processor = id, connectionId = receive.source, session = session, buffer = receive.payload, memoryPool = memoryPool, startTimeMs = time.milliseconds, securityProtocol = protocol)
         requestChannel.sendRequest(req)
         selector.mute(receive.source)
       } catch {

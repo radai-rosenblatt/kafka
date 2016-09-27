@@ -31,10 +31,9 @@ import org.apache.kafka.common.security.auth.KafkaPrincipal
 import org.apache.kafka.common.TopicPartition
 import org.apache.kafka.common.requests.{ProduceRequest, RequestHeader}
 import org.apache.kafka.common.utils.SystemTime
-
 import kafka.server.KafkaConfig
 import kafka.utils.TestUtils
-
+import org.apache.kafka.common.memory.MemoryPool
 import org.junit.Assert._
 import org.junit._
 import org.scalatest.junit.JUnitSuite
@@ -304,9 +303,9 @@ class SocketServerTest extends JUnitSuite {
     val serverMetrics = new Metrics
     var conn: Socket = null
     val overrideServer = new SocketServer(KafkaConfig.fromProps(props), serverMetrics, new SystemTime) {
-      override def newProcessor(id: Int, connectionQuotas: ConnectionQuotas, protocol: SecurityProtocol): Processor = {
+      override def newProcessor(id: Int, connectionQuotas: ConnectionQuotas, protocol: SecurityProtocol, memoryPool: MemoryPool): Processor = {
         new Processor(id, time, config.socketRequestMaxBytes, requestChannel, connectionQuotas,
-          config.connectionsMaxIdleMs, protocol, config.values, metrics) {
+          config.connectionsMaxIdleMs, protocol, config.values, metrics, MemoryPool.NONE) {
           override protected[network] def sendResponse(response: RequestChannel.Response) {
             conn.close()
             super.sendResponse(response)

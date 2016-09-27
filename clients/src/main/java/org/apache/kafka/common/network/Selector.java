@@ -22,6 +22,8 @@ import java.nio.channels.SocketChannel;
 import java.nio.channels.UnresolvedAddressException;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.Collection;
+import java.util.Collections;
 import java.util.Deque;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -33,6 +35,7 @@ import java.util.Set;
 import java.util.concurrent.TimeUnit;
 
 import org.apache.kafka.common.KafkaException;
+import org.apache.kafka.common.memory.MemoryPool;
 import org.apache.kafka.common.metrics.Measurable;
 import org.apache.kafka.common.metrics.MetricConfig;
 import org.apache.kafka.common.MetricName;
@@ -97,6 +100,7 @@ public class Selector implements Selectable {
     private final int maxReceiveSize;
     private final boolean metricsPerConnection;
     private final IdleExpiryManager idleExpiryManager;
+    private final MemoryPool memoryPool;
 
     /**
      * Create a new nioSelector
@@ -117,7 +121,8 @@ public class Selector implements Selectable {
                     String metricGrpPrefix,
                     Map<String, String> metricTags,
                     boolean metricsPerConnection,
-                    ChannelBuilder channelBuilder) {
+                    ChannelBuilder channelBuilder,
+                    MemoryPool memoryPool) {
         try {
             this.nioSelector = java.nio.channels.Selector.open();
         } catch (IOException e) {
@@ -139,6 +144,18 @@ public class Selector implements Selectable {
         this.channelBuilder = channelBuilder;
         this.metricsPerConnection = metricsPerConnection;
         this.idleExpiryManager = connectionMaxIdleMs < 0 ? null : new IdleExpiryManager(time, connectionMaxIdleMs);
+        this.memoryPool = memoryPool;
+    }
+
+    public Selector(int maxReceiveSize,
+        long connectionMaxIdleMs,
+        Metrics metrics,
+        Time time,
+        String metricGrpPrefix,
+        Map<String, String> metricTags,
+        boolean metricsPerConnection,
+        ChannelBuilder channelBuilder) {
+        this(maxReceiveSize, connectionMaxIdleMs, metrics, time, metricGrpPrefix, metricTags, metricsPerConnection, channelBuilder, MemoryPool.NONE);
     }
 
     public Selector(long connectionMaxIdleMS, Metrics metrics, Time time, String metricGrpPrefix, ChannelBuilder channelBuilder) {
@@ -183,7 +200,7 @@ public class Selector implements Selectable {
             throw e;
         }
         SelectionKey key = socketChannel.register(nioSelector, SelectionKey.OP_CONNECT);
-        KafkaChannel channel = channelBuilder.buildChannel(id, key, maxReceiveSize);
+        KafkaChannel channel = channelBuilder.buildChannel(id, key, maxReceiveSize, memoryPool);
         key.attach(channel);
         this.channels.put(id, channel);
 
@@ -202,7 +219,7 @@ public class Selector implements Selectable {
      */
     public void register(String id, SocketChannel socketChannel) throws ClosedChannelException {
         SelectionKey key = socketChannel.register(nioSelector, SelectionKey.OP_READ);
-        KafkaChannel channel = channelBuilder.buildChannel(id, key, maxReceiveSize);
+        KafkaChannel channel = channelBuilder.buildChannel(id, key, maxReceiveSize, memoryPool);
         key.attach(channel);
         this.channels.put(id, channel);
     }
@@ -302,71 +319,88 @@ public class Selector implements Selectable {
         maybeCloseOldestConnection(endSelect);
     }
 
-    private void pollSelectionKeys(Iterable<SelectionKey> selectionKeys,
+    private void pollSelectionKeys(Set<SelectionKey> selectionKeys,
                                    boolean isImmediatelyConnected,
                                    long currentTimeNanos) {
-        Iterator<SelectionKey> iterator = selectionKeys.iterator();
-        while (iterator.hasNext()) {
-            SelectionKey key = iterator.next();
-            iterator.remove();
-            KafkaChannel channel = channel(key);
+        //it is possible that the iteration order over selectionKeys is the same every invocation.
+        //this may cause starvation of reads when memory is low. to address this we shuffle the keys
+        Collection<SelectionKey> inHandlingOrder;
+        List<SelectionKey> keysHandled = new ArrayList<>(selectionKeys.size());
+        if (memoryPool.isLowOnMemory()) {
+            List<SelectionKey> temp = new ArrayList<>(selectionKeys);
+            Collections.shuffle(temp);
+            inHandlingOrder = temp;
+        } else {
+            inHandlingOrder = selectionKeys;
+        }
+        try {
+            for (SelectionKey key : inHandlingOrder) {
+                keysHandled.add(key);
+                KafkaChannel channel = channel(key);
 
-            // register all per-connection metrics at once
-            sensors.maybeRegisterConnectionMetrics(channel.id());
-            if (idleExpiryManager != null)
-                idleExpiryManager.update(channel.id(), currentTimeNanos);
+                // register all per-connection metrics at once
+                sensors.maybeRegisterConnectionMetrics(channel.id());
+                if (idleExpiryManager != null)
+                    idleExpiryManager.update(channel.id(), currentTimeNanos);
 
-            try {
+                try {
 
-                /* complete any connections that have finished their handshake (either normally or immediately) */
-                if (isImmediatelyConnected || key.isConnectable()) {
-                    if (channel.finishConnect()) {
-                        this.connected.add(channel.id());
-                        this.sensors.connectionCreated.record();
-                        SocketChannel socketChannel = (SocketChannel) key.channel();
-                        log.debug("Created socket with SO_RCVBUF = {}, SO_SNDBUF = {}, SO_TIMEOUT = {} to node {}",
-                                socketChannel.socket().getReceiveBufferSize(),
-                                socketChannel.socket().getSendBufferSize(),
-                                socketChannel.socket().getSoTimeout(),
-                                channel.id());
-                    } else
-                        continue;
-                }
-
-                /* if channel is not ready finish prepare */
-                if (channel.isConnected() && !channel.ready())
-                    channel.prepare();
-
-                /* if channel is ready read from any connections that have readable data */
-                if (channel.ready() && key.isReadable() && !hasStagedReceive(channel)) {
-                    NetworkReceive networkReceive;
-                    while ((networkReceive = channel.read()) != null)
-                        addToStagedReceives(channel, networkReceive);
-                }
-
-                /* if channel is ready write to any sockets that have space in their buffer and for which we have data */
-                if (channel.ready() && key.isWritable()) {
-                    Send send = channel.write();
-                    if (send != null) {
-                        this.completedSends.add(send);
-                        this.sensors.recordBytesSent(channel.id(), send.size());
+                    /* complete any connections that have finished their handshake (either normally or immediately) */
+                    if (isImmediatelyConnected || key.isConnectable()) {
+                        if (channel.finishConnect()) {
+                            this.connected.add(channel.id());
+                            this.sensors.connectionCreated.record();
+                            SocketChannel socketChannel = (SocketChannel) key.channel();
+                            log.debug("Created socket with SO_RCVBUF = {}, SO_SNDBUF = {}, SO_TIMEOUT = {} to node {}",
+                                    socketChannel.socket().getReceiveBufferSize(),
+                                    socketChannel.socket().getSendBufferSize(),
+                                    socketChannel.socket().getSoTimeout(),
+                                    channel.id());
+                        } else
+                            continue;
                     }
-                }
 
-                /* cancel any defunct sockets */
-                if (!key.isValid()) {
+                    /* if channel is not ready finish prepare */
+                    if (channel.isConnected() && !channel.ready())
+                        channel.prepare();
+
+                    /* if channel is ready read from any connections that have readable data */
+                    if (channel.ready() && key.isReadable() && !hasStagedReceive(channel)) {
+                        NetworkReceive networkReceive;
+                        while ((networkReceive = channel.read()) != null)
+                            addToStagedReceives(channel, networkReceive);
+                    }
+
+                    /* if channel is ready write to any sockets that have space in their buffer and for which we have data */
+                    if (channel.ready() && key.isWritable()) {
+                        Send send = channel.write();
+                        if (send != null) {
+                            this.completedSends.add(send);
+                            this.sensors.recordBytesSent(channel.id(), send.size());
+                        }
+                    }
+
+                    /* cancel any defunct sockets */
+                    if (!key.isValid()) {
+                        close(channel);
+                        this.disconnected.add(channel.id());
+                    }
+
+                } catch (Exception e) {
+                    String desc = channel.socketDescription();
+                    if (e instanceof IOException)
+                        log.debug("Connection with {} disconnected", desc, e);
+                    else
+                        log.warn("Unexpected error from {}; closing connection", desc, e);
                     close(channel);
                     this.disconnected.add(channel.id());
                 }
-
-            } catch (Exception e) {
-                String desc = channel.socketDescription();
-                if (e instanceof IOException)
-                    log.debug("Connection with {} disconnected", desc, e);
-                else
-                    log.warn("Unexpected error from {}; closing connection", desc, e);
-                close(channel);
-                this.disconnected.add(channel.id());
+            }
+        } finally {
+            if (keysHandled.size() == selectionKeys.size()) {
+                selectionKeys.clear();
+            } else {
+                selectionKeys.removeAll(keysHandled);
             }
         }
     }

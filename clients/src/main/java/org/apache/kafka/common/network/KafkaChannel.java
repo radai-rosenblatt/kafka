@@ -26,6 +26,7 @@ import java.nio.channels.SelectionKey;
 
 import java.security.Principal;
 
+import org.apache.kafka.common.memory.MemoryPool;
 import org.apache.kafka.common.utils.Utils;
 
 public class KafkaChannel {
@@ -33,14 +34,20 @@ public class KafkaChannel {
     private final TransportLayer transportLayer;
     private final Authenticator authenticator;
     private final int maxReceiveSize;
+    private final MemoryPool memoryPool;
     private NetworkReceive receive;
     private Send send;
 
     public KafkaChannel(String id, TransportLayer transportLayer, Authenticator authenticator, int maxReceiveSize) throws IOException {
+        this(id, transportLayer, authenticator, maxReceiveSize, MemoryPool.NONE);
+    }
+
+    public KafkaChannel(String id, TransportLayer transportLayer, Authenticator authenticator, int maxReceiveSize, MemoryPool memoryPool) throws IOException {
         this.id = id;
         this.transportLayer = transportLayer;
         this.authenticator = authenticator;
         this.maxReceiveSize = maxReceiveSize;
+        this.memoryPool = memoryPool;
     }
 
     public void close() throws IOException {
@@ -129,7 +136,7 @@ public class KafkaChannel {
         NetworkReceive result = null;
 
         if (receive == null) {
-            receive = new NetworkReceive(maxReceiveSize, id);
+            receive = new NetworkReceive(maxReceiveSize, id, memoryPool);
         }
 
         receive(receive);

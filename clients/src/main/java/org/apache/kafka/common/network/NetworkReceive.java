@@ -17,6 +17,7 @@ import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.channels.ReadableByteChannel;
 import java.nio.channels.ScatteringByteChannel;
+import org.apache.kafka.common.memory.MemoryPool;
 
 /**
  * A size delimited Receive that consists of a 4 byte network-ordered size N followed by N bytes of content
@@ -25,10 +26,13 @@ public class NetworkReceive implements Receive {
 
     public final static String UNKNOWN_SOURCE = "";
     public final static int UNLIMITED = -1;
+    private final static ByteBuffer EMPTY_BUFFER = ByteBuffer.allocate(0);
 
     private final String source;
     private final ByteBuffer size;
     private final int maxSize;
+    private final MemoryPool memoryPool;
+    private int requestedBufferSize = -1;
     private ByteBuffer buffer;
 
 
@@ -37,6 +41,7 @@ public class NetworkReceive implements Receive {
         this.buffer = buffer;
         this.size = null;
         this.maxSize = UNLIMITED;
+        this.memoryPool = MemoryPool.NONE;
     }
 
     public NetworkReceive(String source) {
@@ -44,6 +49,7 @@ public class NetworkReceive implements Receive {
         this.size = ByteBuffer.allocate(4);
         this.buffer = null;
         this.maxSize = UNLIMITED;
+        this.memoryPool = MemoryPool.NONE;
     }
 
     public NetworkReceive(int maxSize, String source) {
@@ -51,6 +57,15 @@ public class NetworkReceive implements Receive {
         this.size = ByteBuffer.allocate(4);
         this.buffer = null;
         this.maxSize = maxSize;
+        this.memoryPool = MemoryPool.NONE;
+    }
+
+    public NetworkReceive(int maxSize, String source, MemoryPool memoryPool) {
+        this.source = source;
+        this.size = ByteBuffer.allocate(4);
+        this.buffer = null;
+        this.maxSize = maxSize;
+        this.memoryPool = memoryPool;
     }
 
     public NetworkReceive() {
@@ -89,9 +104,14 @@ public class NetworkReceive implements Receive {
                     throw new InvalidReceiveException("Invalid receive (size = " + receiveSize + ")");
                 if (maxSize != UNLIMITED && receiveSize > maxSize)
                     throw new InvalidReceiveException("Invalid receive (size = " + receiveSize + " larger than " + maxSize + ")");
-
-                this.buffer = ByteBuffer.allocate(receiveSize);
+                requestedBufferSize = receiveSize; //may be 0 (?!)
+                if (receiveSize == 0) {
+                    buffer = EMPTY_BUFFER;
+                }
             }
+        }
+        if (buffer == null && requestedBufferSize != -1) { //we know the size we want but havent been able to allocate it yet
+            buffer = memoryPool.tryAllocate(requestedBufferSize);
         }
         if (buffer != null) {
             int bytesRead = channel.read(buffer);
